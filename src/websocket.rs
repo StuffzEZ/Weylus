@@ -63,6 +63,8 @@ pub struct WeylusClientConfig {
     #[cfg(target_os = "linux")]
     pub wayland_support: bool,
     pub no_gui: bool,
+    #[cfg(target_os = "windows")]
+    pub translate_mouse_to_touch: bool,
 }
 
 impl<S, R, FnUInput> WeylusClientHandler<S, R, FnUInput> {
@@ -274,7 +276,10 @@ impl<S, R, FnUInput> WeylusClientHandler<S, R, FnUInput> {
             #[cfg(target_os = "windows")]
             if self.input_device.is_none() {
                 self.input_device = Some(Box::new(
-                    crate::input::autopilot_device_win::WindowsInput::new(capturable.clone()),
+                    crate::input::autopilot_device_win::WindowsInput::new(
+                        capturable.clone(),
+                        self.config.translate_mouse_to_touch,
+                    ),
                 ));
             } else {
                 self.input_device

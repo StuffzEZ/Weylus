@@ -12,16 +12,20 @@ use crate::protocol::{
 
 use crate::capturable::{Capturable, Geometry};
 
+const MAX_TOUCH_POINTS: usize = 5;
+
 pub struct WindowsInput {
     capturable: Box<dyn Capturable>,
     autopilot_device: AutoPilotDevice,
     pointer_device_handle: *mut HSYNTHETICPOINTERDEVICE__,
     touch_device_handle: *mut HSYNTHETICPOINTERDEVICE__,
-    multitouch_map: std::collections::HashMap<i64, POINTER_TYPE_INFO>,
+    active_touch_points: std::collections::HashMap<i64, POINTER_TYPE_INFO>,
+    touch_slots: [Option<i64>; MAX_TOUCH_POINTS],
+    translate_mouse_to_touch: bool,
 }
 
 impl WindowsInput {
-    pub fn new(capturable: Box<dyn Capturable>) -> Self {
+    pub fn new(capturable: Box<dyn Capturable>, translate_mouse_to_touch: bool) -> Self {
         unsafe {
             InitializeTouchInjection(5, TOUCH_FEEDBACK_DEFAULT);
             Self {
@@ -29,8 +33,139 @@ impl WindowsInput {
                 autopilot_device: AutoPilotDevice::new(capturable),
                 pointer_device_handle: CreateSyntheticPointerDevice(PT_PEN, 1, 1),
                 touch_device_handle: CreateSyntheticPointerDevice(PT_TOUCH, 5, 1),
-                multitouch_map: std::collections::HashMap::new(),
+                active_touch_points: std::collections::HashMap::new(),
+                touch_slots: [None; MAX_TOUCH_POINTS],
+                translate_mouse_to_touch,
             }
+        }
+    }
+
+    fn touch_id_for(&self, remote_pointer_id: i64) -> Option<u32> {
+        self.touch_slots
+            .iter()
+            .position(|id| id.is_some_and(|id| id == remote_pointer_id))
+            .map(|idx| (idx as u32) + 1)
+    }
+
+    fn allocate_touch_id(&mut self, remote_pointer_id: i64) -> Option<u32> {
+        if let Some(id) = self.touch_id_for(remote_pointer_id) {
+            return Some(id);
+        }
+        let free_slot = self.touch_slots.iter().position(|v| v.is_none())?;
+        self.touch_slots[free_slot] = Some(remote_pointer_id);
+        Some((free_slot as u32) + 1)
+    }
+
+    fn free_touch_id(&mut self, remote_pointer_id: i64) {
+        if let Some(slot) = self
+            .touch_slots
+            .iter()
+            .position(|id| id.is_some_and(|id| id == remote_pointer_id))
+        {
+            self.touch_slots[slot] = None;
+        }
+    }
+
+    fn inject_active_touches(&mut self) {
+        if self.active_touch_points.is_empty() {
+            return;
+        }
+        unsafe {
+            let mut infos: Vec<POINTER_TYPE_INFO> =
+                self.active_touch_points.values().copied().collect();
+            InjectSyntheticPointerInput(
+                self.touch_device_handle,
+                infos.as_mut_ptr(),
+                infos.len() as u32,
+            );
+        }
+    }
+
+    fn send_touch_pointer_event(&mut self, event: &PointerEvent, x: i32, y: i32) {
+        let is_terminal = matches!(
+            event.event_type,
+            PointerEventType::UP
+                | PointerEventType::CANCEL
+                | PointerEventType::LEAVE
+                | PointerEventType::OUT
+        );
+
+        let touch_id = if matches!(event.event_type, PointerEventType::DOWN) {
+            self.allocate_touch_id(event.pointer_id)
+        } else {
+            self.touch_id_for(event.pointer_id)
+        };
+
+        let Some(touch_id) = touch_id else {
+            return;
+        };
+
+        let mut pointer_flags = match event.event_type {
+            PointerEventType::DOWN => {
+                POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_DOWN
+            }
+            PointerEventType::MOVE | PointerEventType::OVER | PointerEventType::ENTER => {
+                let mut flags = POINTER_FLAG_INRANGE | POINTER_FLAG_UPDATE;
+                if self.active_touch_points.contains_key(&event.pointer_id) {
+                    flags |= POINTER_FLAG_INCONTACT;
+                }
+                flags
+            }
+            PointerEventType::UP => POINTER_FLAG_INRANGE | POINTER_FLAG_UP,
+            PointerEventType::CANCEL | PointerEventType::LEAVE | PointerEventType::OUT => {
+                POINTER_FLAG_INRANGE | POINTER_FLAG_UPDATE | POINTER_FLAG_CANCELED
+            }
+        };
+
+        if event.is_primary {
+            pointer_flags |= POINTER_FLAG_PRIMARY;
+        }
+
+        unsafe {
+            let mut pointer_type_info = POINTER_TYPE_INFO {
+                type_: PT_TOUCH,
+                u: std::mem::zeroed(),
+            };
+
+            let mut pointer_touch_info: POINTER_TOUCH_INFO = std::mem::zeroed();
+            pointer_touch_info.pointerInfo = std::mem::zeroed();
+            pointer_touch_info.pointerInfo.pointerType = PT_TOUCH;
+            pointer_touch_info.pointerInfo.pointerFlags = pointer_flags;
+            pointer_touch_info.pointerInfo.pointerId = touch_id;
+            pointer_touch_info.pointerInfo.ptPixelLocation = POINT { x, y };
+            pointer_touch_info.pointerInfo.ptPixelLocationRaw = POINT { x, y };
+            pointer_touch_info.touchFlags = TOUCH_FLAG_NONE;
+            pointer_touch_info.touchMask = TOUCH_MASK_PRESSURE;
+            pointer_touch_info.pressure = (event.pressure * 1024f64) as u32;
+            pointer_touch_info.pointerInfo.ButtonChangeType = POINTER_CHANGE_NONE;
+
+            *pointer_type_info.u.touchInfo_mut() = pointer_touch_info;
+            self.active_touch_points
+                .insert(event.pointer_id, pointer_type_info);
+
+            self.inject_active_touches();
+
+            if is_terminal {
+                self.active_touch_points.remove(&event.pointer_id);
+                self.free_touch_id(event.pointer_id);
+            }
+        }
+    }
+
+    fn should_translate_mouse_to_touch(&self, event: &PointerEvent) -> bool {
+        if !self.translate_mouse_to_touch {
+            return false;
+        }
+        if self.active_touch_points.contains_key(&event.pointer_id) {
+            return true;
+        }
+        match event.event_type {
+            PointerEventType::DOWN => event.button == Button::PRIMARY,
+            PointerEventType::MOVE | PointerEventType::OVER | PointerEventType::ENTER => {
+                event.buttons.contains(Button::PRIMARY)
+            }
+            PointerEventType::UP => event.button == Button::PRIMARY,
+            PointerEventType::CANCEL | PointerEventType::LEAVE | PointerEventType::OUT => true,
         }
     }
 }
@@ -55,34 +190,37 @@ impl InputDevice for WindowsInput {
             (event.x * width as f64) as i32 + offset_x,
             (event.y * height as f64) as i32 + offset_y,
         );
-        let mut pointer_flags = match event.event_type {
-            PointerEventType::DOWN => {
-                POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_DOWN
-            }
-            PointerEventType::MOVE | PointerEventType::OVER | PointerEventType::ENTER => {
-                POINTER_FLAG_INRANGE | POINTER_FLAG_UPDATE
-            }
-            PointerEventType::UP => POINTER_FLAG_UP,
-            PointerEventType::CANCEL | PointerEventType::LEAVE | PointerEventType::OUT => {
-                POINTER_FLAG_INRANGE | POINTER_FLAG_UPDATE | POINTER_FLAG_CANCELED
-            }
-        };
-        let button_change_type = match event.buttons {
-            Button::PRIMARY => {
-                pointer_flags |= POINTER_FLAG_INCONTACT;
-                POINTER_CHANGE_FIRSTBUTTON_DOWN
-            }
-            Button::SECONDARY => POINTER_CHANGE_SECONDBUTTON_DOWN,
-            Button::AUXILARY => POINTER_CHANGE_THIRDBUTTON_DOWN,
-            Button::NONE => POINTER_CHANGE_NONE,
-            _ => POINTER_CHANGE_NONE,
-        };
-        if event.is_primary {
-            pointer_flags |= POINTER_FLAG_PRIMARY;
-        }
+
         match event.pointer_type {
             PointerType::Pen => {
                 unsafe {
+                    let mut pointer_flags = match event.event_type {
+                        PointerEventType::DOWN => {
+                            POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_DOWN
+                        }
+                        PointerEventType::MOVE
+                        | PointerEventType::OVER
+                        | PointerEventType::ENTER => POINTER_FLAG_INRANGE | POINTER_FLAG_UPDATE,
+                        PointerEventType::UP => POINTER_FLAG_UP,
+                        PointerEventType::CANCEL
+                        | PointerEventType::LEAVE
+                        | PointerEventType::OUT => {
+                            POINTER_FLAG_INRANGE | POINTER_FLAG_UPDATE | POINTER_FLAG_CANCELED
+                        }
+                    };
+                    let button_change_type = match event.buttons {
+                        Button::PRIMARY => {
+                            pointer_flags |= POINTER_FLAG_INCONTACT;
+                            POINTER_CHANGE_FIRSTBUTTON_DOWN
+                        }
+                        Button::SECONDARY => POINTER_CHANGE_SECONDBUTTON_DOWN,
+                        Button::AUXILARY => POINTER_CHANGE_THIRDBUTTON_DOWN,
+                        Button::NONE => POINTER_CHANGE_NONE,
+                        _ => POINTER_CHANGE_NONE,
+                    };
+                    if event.is_primary {
+                        pointer_flags |= POINTER_FLAG_PRIMARY;
+                    }
                     let mut pointer_type_info = POINTER_TYPE_INFO {
                         type_: PT_PEN,
                         u: std::mem::zeroed(),
@@ -120,54 +258,14 @@ impl InputDevice for WindowsInput {
                 }
             }
             PointerType::Touch => {
-                unsafe {
-                    let mut pointer_type_info = POINTER_TYPE_INFO {
-                        type_: PT_TOUCH,
-                        u: std::mem::zeroed(),
-                    };
-
-                    let mut pointer_touch_info: POINTER_TOUCH_INFO = std::mem::zeroed();
-                    pointer_touch_info.pointerInfo = std::mem::zeroed();
-                    pointer_touch_info.pointerInfo.pointerType = PT_TOUCH;
-                    pointer_touch_info.pointerInfo.pointerFlags = pointer_flags;
-                    pointer_touch_info.pointerInfo.pointerId = event.pointer_id as u32; //event.pointer_id as u32; Using the actual pointer id causes errors in the touch injection
-                    pointer_touch_info.pointerInfo.ptPixelLocation = POINT { x, y };
-                    pointer_touch_info.touchFlags = TOUCH_FLAG_NONE;
-                    pointer_touch_info.touchMask = TOUCH_MASK_PRESSURE;
-                    pointer_touch_info.pressure = (event.pressure * 1024f64) as u32;
-
-                    pointer_touch_info.pointerInfo.ButtonChangeType = button_change_type;
-
-                    *pointer_type_info.u.touchInfo_mut() = pointer_touch_info;
-                    self.multitouch_map
-                        .insert(event.pointer_id, pointer_type_info);
-                    let len = self.multitouch_map.len();
-
-                    let mut pointer_type_info_vec: Vec<POINTER_TYPE_INFO> = Vec::new();
-                    for (_i, info) in self.multitouch_map.iter().enumerate() {
-                        pointer_type_info_vec.push(*info.1);
-                    }
-                    let b: Box<[POINTER_TYPE_INFO]> = pointer_type_info_vec.into_boxed_slice();
-                    let m: *mut POINTER_TYPE_INFO = Box::into_raw(b) as _;
-
-                    InjectSyntheticPointerInput(self.touch_device_handle, m, len as u32);
-
-                    match event.event_type {
-                        PointerEventType::DOWN
-                        | PointerEventType::MOVE
-                        | PointerEventType::OVER
-                        | PointerEventType::ENTER => {}
-
-                        PointerEventType::UP
-                        | PointerEventType::CANCEL
-                        | PointerEventType::LEAVE
-                        | PointerEventType::OUT => {
-                            self.multitouch_map.remove(&event.pointer_id);
-                        }
-                    }
-                }
+                self.send_touch_pointer_event(event, x, y);
             }
             PointerType::Mouse => {
+                if self.should_translate_mouse_to_touch(event) {
+                    self.send_touch_pointer_event(event, x, y);
+                    return;
+                }
+
                 let mut dw_flags = 0;
 
                 let (screen_x, screen_y) = (
@@ -209,7 +307,7 @@ impl InputDevice for WindowsInput {
                 }
                 unsafe { mouse_event(dw_flags, 0 as u32, 0 as u32, 0, 0) };
             }
-            PointerType::Unknown => todo!(),
+            PointerType::Unknown => {}
         }
     }
 

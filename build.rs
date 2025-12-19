@@ -7,6 +7,16 @@ fn build_ffmpeg(dist_dir: &Path, enable_libnpp: bool) {
         return;
     }
 
+    let _ = Command::new("bash")
+        .args([
+            "-c",
+            "for f in clean.sh build.sh download.sh x264.sh ffmpeg.sh nv-codec-headers.sh libva.sh clean_all.sh; do \
+                test -f \"$f\" && sed -i 's/\\r$//' \"$f\"; \
+            done",
+        ])
+        .current_dir("deps")
+        .status();
+
     Command::new("bash")
         .arg(Path::new("clean.sh"))
         .current_dir("deps")
@@ -33,25 +43,16 @@ fn main() {
     let dist_dir = Path::new("deps")
         .canonicalize()
         .unwrap()
-        .join(format!("dist_{}", target_os));
+        .join(format!("dist_{target_os}"));
 
-    let enable_libnpp = env::var("I_AM_BUILDING_THIS_AT_HOME_AND_WANT_LIBNPP").map_or(false, |v| {
-        ["y", "yes", "true", "1"].contains(&v.to_lowercase().as_str())
-    });
+    let enable_libnpp = env::var("I_AM_BUILDING_THIS_AT_HOME_AND_WANT_LIBNPP")
+        .is_ok_and(|v| ["y", "yes", "true", "1"].contains(&v.to_lowercase().as_str()));
 
     if env::var("CARGO_FEATURE_FFMPEG_SYSTEM").is_err() {
         build_ffmpeg(&dist_dir, enable_libnpp);
     }
 
     println!("cargo:rerun-if-changed=ts/lib.ts");
-
-    #[cfg(not(target_os = "windows"))]
-    let mut tsc_command = Command::new("tsc");
-
-    #[cfg(target_os = "windows")]
-    let mut tsc_command = Command::new("bash");
-    #[cfg(target_os = "windows")]
-    tsc_command.args(&["-c", "tsc"]);
 
     let js_needs_update = || -> Result<bool, Box<dyn std::error::Error>> {
         Ok(Path::new("ts/lib.ts").metadata()?.modified()?
@@ -60,20 +61,26 @@ fn main() {
     .unwrap_or(true);
 
     if js_needs_update {
-        match tsc_command.status() {
+        #[cfg(not(target_os = "windows"))]
+        let status = Command::new("tsc").status();
+
+        #[cfg(target_os = "windows")]
+        let status = Command::new("cmd").args(["/C", "tsc"]).status();
+
+        let status = match status {
+            Ok(status) => status,
             Err(err) => {
-                println!("cargo:warning=Failed to call tsc: {}", err);
+                println!("cargo:warning=Failed to call tsc: {err}");
                 std::process::exit(1);
             }
-            Ok(status) => {
-                if !status.success() {
-                    match status.code() {
-                        Some(code) => println!("cargo:warning=tsc failed with exitcode: {}", code),
-                        None => println!("cargo:warning=tsc terminated by signal."),
-                    };
-                    std::process::exit(2);
-                }
-            }
+        };
+
+        if !status.success() {
+            match status.code() {
+                Some(code) => println!("cargo:warning=tsc failed with exitcode: {code}"),
+                None => println!("cargo:warning=tsc terminated by signal."),
+            };
+            std::process::exit(2);
         }
     }
 
@@ -114,18 +121,18 @@ fn main() {
         } else {
             "static"
         };
-    println!("cargo:rustc-link-lib={}=avdevice", ffmpeg_link_kind);
-    println!("cargo:rustc-link-lib={}=avformat", ffmpeg_link_kind);
-    println!("cargo:rustc-link-lib={}=avfilter", ffmpeg_link_kind);
-    println!("cargo:rustc-link-lib={}=avcodec", ffmpeg_link_kind);
-    println!("cargo:rustc-link-lib={}=swresample", ffmpeg_link_kind);
-    println!("cargo:rustc-link-lib={}=swscale", ffmpeg_link_kind);
-    println!("cargo:rustc-link-lib={}=avutil", ffmpeg_link_kind);
-    println!("cargo:rustc-link-lib={}=x264", ffmpeg_link_kind);
+    println!("cargo:rustc-link-lib={ffmpeg_link_kind}=avdevice");
+    println!("cargo:rustc-link-lib={ffmpeg_link_kind}=avformat");
+    println!("cargo:rustc-link-lib={ffmpeg_link_kind}=avfilter");
+    println!("cargo:rustc-link-lib={ffmpeg_link_kind}=avcodec");
+    println!("cargo:rustc-link-lib={ffmpeg_link_kind}=swresample");
+    println!("cargo:rustc-link-lib={ffmpeg_link_kind}=swscale");
+    println!("cargo:rustc-link-lib={ffmpeg_link_kind}=avutil");
+    println!("cargo:rustc-link-lib={ffmpeg_link_kind}=x264");
     if enable_libnpp {
         if let Ok(lib_paths) = env::var("LIBRARY_PATH") {
             for lib_path in lib_paths.split(':') {
-                println!("cargo:rustc-link-search={}", lib_path);
+                println!("cargo:rustc-link-search={lib_path}");
             }
         }
         println!("cargo:rustc-link-lib=dylib=nppig");
@@ -184,9 +191,9 @@ fn linux() {
     } else {
         "dylib"
     };
-    println!("cargo:rustc-link-lib={}=va", va_link_kind);
-    println!("cargo:rustc-link-lib={}=va-drm", va_link_kind);
-    println!("cargo:rustc-link-lib={}=va-x11", va_link_kind);
+    println!("cargo:rustc-link-lib={va_link_kind}=va");
+    println!("cargo:rustc-link-lib={va_link_kind}=va-drm");
+    println!("cargo:rustc-link-lib={va_link_kind}=va-x11");
     println!("cargo:rustc-link-lib=drm");
     println!("cargo:rustc-link-lib=xcb-dri3");
     println!("cargo:rustc-link-lib=X11-xcb");

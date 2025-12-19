@@ -28,6 +28,11 @@ const THEME_LIST: [ThemeType; 8] = [
     ThemeType::Metro,
 ];
 
+#[cfg(target_os = "windows")]
+fn default_translate_mouse_to_touch() -> bool {
+    true
+}
+
 impl Default for ThemeType {
     fn default() -> Self {
         Self::Greybird
@@ -101,6 +106,15 @@ pub struct Config {
     )]
     #[serde(default)]
     pub try_mediafoundation: bool,
+    #[cfg(target_os = "windows")]
+    #[arg(
+        long,
+        action = clap::ArgAction::Set,
+        default_value_t = true,
+        help = "Translate primary mouse input to touch input."
+    )]
+    #[serde(default = "default_translate_mouse_to_touch")]
+    pub translate_mouse_to_touch: bool,
     #[arg(long, help = "Start Weylus server immediately on program start.")]
     #[serde(default)]
     pub auto_start: bool,

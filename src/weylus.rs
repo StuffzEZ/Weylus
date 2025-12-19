@@ -71,6 +71,8 @@ impl Weylus {
                 #[cfg(target_os = "linux")]
                 wayland_support: config.wayland_support,
                 no_gui: config.no_gui,
+                #[cfg(target_os = "windows")]
+                translate_mouse_to_touch: config.translate_mouse_to_touch,
             },
         );
 
